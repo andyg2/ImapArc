@@ -56,6 +56,31 @@ def get_date_search_criteria(start_date, end_date):
     
     return ' '.join(criteria)
 
+def get_all_folders(mail):
+    """Get list of all folders from IMAP server"""
+    try:
+        status, folders = mail.list()
+        if status != 'OK':
+            print(f"Error getting folder list: {folders}")
+            return []
+        
+        folder_list = []
+        for folder in folders:
+            # Parse folder name from IMAP LIST response
+            # Format: '(\\HasNoChildren) "/" "INBOX"'
+            folder_str = folder.decode('utf-8')
+            parts = folder_str.split('"')
+            if len(parts) >= 3:
+                folder_name = parts[-2]  # Get the folder name
+                folder_list.append(folder_name)
+        
+        print(f"Found {len(folder_list)} folders: {', '.join(folder_list)}")
+        return folder_list
+    
+    except Exception as e:
+        print(f"Error getting folders: {e}")
+        return []
+
 def search_messages(mail, folder, date_criteria):
     """Search for messages based on criteria"""
     try:
@@ -84,8 +109,8 @@ def search_messages(mail, folder, date_criteria):
         print(f"Error searching messages: {e}")
         return []
 
-def download_message(mail, msg_id, output_dir):
-    """Download a single message"""
+def download_message(mail, msg_id, output_dir, delete_after_download=False):
+    """Download a single message and optionally delete it from server"""
     try:
         # Fetch message
         status, msg_data = mail.fetch(msg_id, '(RFC822)')
@@ -126,10 +151,34 @@ def download_message(mail, msg_id, output_dir):
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
         
+        # Delete from server if requested and download was successful
+        if delete_after_download:
+            try:
+                # Mark message for deletion
+                mail.store(msg_id, '+FLAGS', '\\Deleted')
+                print(f"  Marked message {msg_id.decode()} for deletion")
+            except Exception as e:
+                print(f"  Warning: Could not mark message {msg_id.decode()} for deletion: {e}")
+                # Don't return False here as the download was successful
+        
         return True
     
     except Exception as e:
         print(f"Error downloading message {msg_id}: {e}")
+        return False
+
+def expunge_deleted_messages(mail, folder):
+    """Expunge (permanently delete) messages marked for deletion"""
+    try:
+        # Select the folder again to ensure we're in the right context
+        mail.select(folder)
+        
+        # Expunge deleted messages
+        mail.expunge()
+        print(f"  Expunged deleted messages from {folder}")
+        return True
+    except Exception as e:
+        print(f"  Error expunging messages from {folder}: {e}")
         return False
 
 def get_folder_size(folder_path: Path) -> int:
@@ -257,96 +306,132 @@ def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed:
         json.dump(compression_summary, f, indent=2)
     
     return compression_summary
-  
-  
-  
-"""Main archiving function"""
-# Create output directory
-output_dir = Path(args.output_dir)
-output_dir.mkdir(parents=True, exist_ok=True)
 
-# Get password if not provided
-password = args.password
-if not password:
-    password = getpass.getpass(f"Password for {args.username}: ")
-
-# Connect to server
-mail = connect_to_server(args.server, args.port, args.username, password, args.ssl)
-if not mail:
-    return False
-
-try:
-    # Get date criteria
-    date_criteria = get_date_search_criteria(args.start_date, args.end_date)
-    print(f"Date criteria: {date_criteria if date_criteria else 'All messages'}")
+def archive_messages(args):
+    """Main archiving function"""
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Process folders
-    folders = args.folders if args.folders else ['INBOX']
+    # Get password if not provided
+    password = args.password
+    if not password:
+        password = getpass.getpass(f"Password for {args.username}: ")
     
-    total_downloaded = 0
-    total_errors = 0
+    # Connect to server
+    mail = connect_to_server(args.server, args.port, args.username, password, args.ssl)
+    if not mail:
+        return False
     
-    for folder in folders:
-        print(f"\nProcessing folder: {folder}")
+    try:
+        # Get date criteria
+        date_criteria = get_date_search_criteria(args.start_date, args.end_date)
+        print(f"Date criteria: {date_criteria if date_criteria else 'All messages'}")
         
-        # Create folder-specific output directory
-        folder_dir = output_dir / folder.replace('/', '_')
-        folder_dir.mkdir(exist_ok=True)
+        # Get folders to process
+        if args.all_folders:
+            print("Getting all folders from server...")
+            folders = get_all_folders(mail)
+            if not folders:
+                print("No folders found or error getting folders")
+                return False
+        else:
+            folders = args.folders if args.folders else ['INBOX']
         
-        # Search messages
-        msg_ids = search_messages(mail, folder, date_criteria)
+        print(f"Processing folders: {', '.join(folders)}")
         
-        if not msg_ids:
-            print(f"No messages found in {folder}")
-            continue
+        # Confirmation for deletion
+        if args.delete_messages:
+            print("\nWARNING: Messages will be PERMANENTLY DELETED from the server after successful download!")
+            if not args.force_delete:
+                confirm = input("Are you sure you want to continue? (yes/no): ").lower()
+                if confirm != 'yes':
+                    print("Operation cancelled.")
+                    return False
         
-        # Download messages
-        for i, msg_id in enumerate(msg_ids, 1):
-            if args.limit and i > args.limit:
-                print(f"Reached limit of {args.limit} messages")
-                break
+        total_downloaded = 0
+        total_errors = 0
+        total_deleted = 0
+        
+        for folder in folders:
+            print(f"\nProcessing folder: {folder}")
             
-            print(f"Downloading message {i}/{len(msg_ids)}: {msg_id.decode()}")
+            # Create folder-specific output directory
+            folder_dir = output_dir / folder.replace('/', '_')
+            folder_dir.mkdir(exist_ok=True)
             
-            if download_message(mail, msg_id, str(folder_dir)):
-                total_downloaded += 1
-            else:
-                total_errors += 1
+            # Search messages
+            msg_ids = search_messages(mail, folder, date_criteria)
             
-            # Progress update
-            if i % 10 == 0:
-                print(f"Progress: {i}/{len(msg_ids)} messages processed")
+            if not msg_ids:
+                print(f"No messages found in {folder}")
+                continue
+            
+            # Download messages
+            folder_downloaded = 0
+            folder_errors = 0
+            
+            for i, msg_id in enumerate(msg_ids, 1):
+                if args.limit and i > args.limit:
+                    print(f"Reached limit of {args.limit} messages")
+                    break
+                
+                print(f"Downloading message {i}/{len(msg_ids)}: {msg_id.decode()}")
+                
+                if download_message(mail, msg_id, str(folder_dir), args.delete_messages):
+                    total_downloaded += 1
+                    folder_downloaded += 1
+                    if args.delete_messages:
+                        total_deleted += 1
+                else:
+                    total_errors += 1
+                    folder_errors += 1
+                
+                # Progress update
+                if i % 10 == 0:
+                    print(f"Progress: {i}/{len(msg_ids)} messages processed")
+            
+            # Expunge deleted messages if deletion was enabled
+            if args.delete_messages and folder_downloaded > 0:
+                print(f"Expunging {folder_downloaded} deleted messages from {folder}...")
+                expunge_deleted_messages(mail, folder)
+            
+            print(f"Folder {folder} complete: {folder_downloaded} downloaded, {folder_errors} errors")
+        
+        print(f"\nArchiving complete!")
+        print(f"Total downloaded: {total_downloaded}")
+        print(f"Total errors: {total_errors}")
+        if args.delete_messages:
+            print(f"Total deleted from server: {total_deleted}")
+        
+        # Create summary report
+        summary = {
+            'timestamp': datetime.now().isoformat(),
+            'server': args.server,
+            'folders': folders,
+            'date_range': {
+                'start': args.start_date.isoformat() if args.start_date else None,
+                'end': args.end_date.isoformat() if args.end_date else None
+            },
+            'total_downloaded': total_downloaded,
+            'total_errors': total_errors,
+            'total_deleted': total_deleted if args.delete_messages else 0,
+            'delete_messages': args.delete_messages
+        }
+        
+        with open(output_dir / 'archive_summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        # Compress folders if requested
+        if args.compress:
+            compression_summary = compress_folders(output_dir, args.max_zip_size, args.keep_uncompressed)
+            print(f"\nCompression complete! Created {len(compression_summary['folders_compressed'])} compressed folder sets.")
+        
+        return True
     
-    print(f"\nArchiving complete!")
-    print(f"Total downloaded: {total_downloaded}")
-    print(f"Total errors: {total_errors}")
-    
-    # Create summary report
-    summary = {
-        'timestamp': datetime.now().isoformat(),
-        'server': args.server,
-        'folders': folders,
-        'date_range': {
-            'start': args.start_date.isoformat() if args.start_date else None,
-            'end': args.end_date.isoformat() if args.end_date else None
-        },
-        'total_downloaded': total_downloaded,
-        'total_errors': total_errors
-    }
-    
-    with open(output_dir / 'archive_summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
-    
-    # Compress folders if requested
-    if args.compress:
-        compression_summary = compress_folders(output_dir, args.max_zip_size, args.keep_uncompressed)
-        print(f"\nCompression complete! Created {len(compression_summary['folders_compressed'])} compressed folder sets.")
-    
-    return True
-
-finally:
-    mail.close()
-    mail.logout()
+    finally:
+        mail.close()
+        mail.logout()
 
 def parse_date(date_string):
     """Parse date string to datetime object"""
@@ -361,14 +446,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Archive all messages from last year with compression
-  python imap_archiver.py -s mail.example.com -u user@example.com --password mypass --start-date 2023-01-01 --end-date 2023-12-31 --compress
+  # Archive all folders with compression and delete from server
+  python imap_archiver.py -s mail.example.com -u user@example.com --password mypass --all-folders --delete-messages --compress
 
-  # Archive messages from specific folders with 50MB zip limit
-  python imap_archiver.py -s mail.example.com -u user@example.com --password mypass --folders INBOX Sent --compress --max-zip-size 50
+  # Archive specific date range from all folders (automated deletion)
+  python imap_archiver.py -s mail.example.com -u user@example.com --password mypass --all-folders --start-date 2023-01-01 --end-date 2023-12-31 --delete-messages --force-delete
 
-  # Archive with custom port and keep uncompressed copies
-  python imap_archiver.py -s mail.example.com -p 143 -u user@example.com --password mypass --no-ssl --compress --keep-uncompressed
+  # Archive with 50MB zip limit and keep originals
+  python imap_archiver.py -s mail.example.com -u user@example.com --password mypass --folders INBOX Sent --compress --max-zip-size 50 --keep-uncompressed
+
+  # Safe archive without deletion (backup mode)
+  python imap_archiver.py -s mail.example.com -u user@example.com --password mypass --all-folders --compress
         """
     )
     
@@ -393,8 +481,16 @@ Examples:
     # Folders and limits
     parser.add_argument('--folders', nargs='+', default=['INBOX'],
                        help='Folders to archive (default: INBOX)')
+    parser.add_argument('--all-folders', action='store_true',
+                       help='Archive all folders from the server (overrides --folders)')
     parser.add_argument('--limit', type=int,
                        help='Maximum number of messages to download per folder')
+    
+    # Message deletion options
+    parser.add_argument('--delete-messages', action='store_true',
+                       help='Delete messages from server after successful download')
+    parser.add_argument('--force-delete', action='store_true',
+                       help='Skip confirmation prompt for message deletion (use with caution!)')
     
     # Output
     parser.add_argument('-o', '--output-dir', default='email_archive',
