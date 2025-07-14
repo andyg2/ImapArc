@@ -96,7 +96,7 @@ def search_messages(mail, folder, date_criteria):
     try:
         # Select folder with error handling
         try:
-            status, messages = mail.select(folder)
+            status, messages = mail.select(f'"{folder}"')
         except imaplib.IMAP4.error as e:
             print(f"Error selecting folder {folder}: {e}")
             return []
@@ -186,7 +186,7 @@ def expunge_deleted_messages(mail, folder):
     """Expunge (permanently delete) messages marked for deletion"""
     try:
         # Select the folder again to ensure we're in the right context
-        mail.select(folder)
+        mail.select(f'"{folder}"')
         
         # Expunge deleted messages
         mail.expunge()
@@ -208,8 +208,15 @@ def get_folder_size(folder_path: Path) -> int:
                 pass
     return total_size
 
-def create_multipart_zip(source_folder: Path, output_dir: Path, max_size_mb: int = 100) -> List[str]:
-    """Create multi-part zip files from source folder"""
+# --- MODIFIED FUNCTION ---
+def create_multipart_zip(source_folder: Path, output_dir: Path, max_size_mb: int = 100, base_name: str = "email_archive") -> List[str]:
+    """
+    Create multi-part (split) zip files from a source folder.
+
+    Note: Python's standard zipfile library creates multiple independent zip files (a "split" archive)
+    rather than a true "spanned" archive (e.g., .z01, .z02, .zip). This implementation
+    splits the content into separate, manageable zip files that must be extracted individually.
+    """
     max_size_bytes = max_size_mb * 1024 * 1024
     
     # Get all files to compress
@@ -222,27 +229,26 @@ def create_multipart_zip(source_folder: Path, output_dir: Path, max_size_mb: int
             files_to_compress.append((file_path, relative_path, file_size))
     
     if not files_to_compress:
-        print(f"No files found in {source_folder}")
+        print(f"No files found in {source_folder} to compress.")
         return []
     
-    # Sort files by size (largest first) for better packing
+    # Sort files by size (largest first) for better packing efficiency
     files_to_compress.sort(key=lambda x: x[2], reverse=True)
     
     zip_files = []
     current_zip_size = 0
     current_zip_num = 1
     
-    # Create base name for zip files
-    base_name = "email_archive"
+    # Use the provided base_name for the zip files
     current_zip_path = output_dir / f"{base_name}_part{current_zip_num:03d}.zip"
     current_zip = zipfile.ZipFile(current_zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6)
     
-    print(f"Creating multi-part zip for {source_folder.name}...")
+    print(f"Creating multi-part zip for '{source_folder.name}' (base name: '{base_name}')...")
     
     for file_path, relative_path, file_size in files_to_compress:
-        # Check if adding this file would exceed the limit
+        # If adding the next file exceeds the size limit (and the zip isn't empty),
+        # close the current zip and start a new one.
         if current_zip_size + file_size > max_size_bytes and current_zip_size > 0:
-            # Close current zip and start new one
             current_zip.close()
             zip_files.append(str(current_zip_path))
             print(f"  Created {current_zip_path.name} ({current_zip_size / (1024*1024):.1f} MB)")
@@ -252,14 +258,14 @@ def create_multipart_zip(source_folder: Path, output_dir: Path, max_size_mb: int
             current_zip = zipfile.ZipFile(current_zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6)
             current_zip_size = 0
         
-        # Add file to current zip
+        # Add file to the current zip
         try:
             current_zip.write(file_path, relative_path)
             current_zip_size += file_size
         except Exception as e:
             print(f"  Warning: Could not add {relative_path} to zip: {e}")
     
-    # Close the last zip file
+    # Close the last zip file if it contains any files
     if current_zip_size > 0:
         current_zip.close()
         zip_files.append(str(current_zip_path))
@@ -267,9 +273,10 @@ def create_multipart_zip(source_folder: Path, output_dir: Path, max_size_mb: int
     
     return zip_files
 
+# --- MODIFIED FUNCTION ---
 def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed: bool = False) -> dict:
-    """Compress all folder archives into multi-part zip files"""
-    print(f"\nCompressing archived folders (max size: {max_zip_size_mb}MB per zip)...")
+    """Compress all uncompressed folder archives into multi-part zip files."""
+    print(f"\nCompressing archived folders (max size: {max_zip_size_mb}MB per zip part)...")
     
     zip_dir = archive_dir / "compressed"
     zip_dir.mkdir(exist_ok=True)
@@ -280,19 +287,21 @@ def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed:
         'folders_compressed': []
     }
     
-    # Find all folder directories to compress
+    # Find all uncompressed folder directories to process
     folder_dirs = [d for d in archive_dir.iterdir() if d.is_dir() and d.name != "compressed"]
     
     for folder_dir in folder_dirs:
-        if folder_dir.name == "compressed":
-            continue
-            
         folder_size = get_folder_size(folder_dir)
         print(f"\nProcessing {folder_dir.name} ({folder_size / (1024*1024):.1f} MB)...")
         
-        # Create multi-part zip
-        zip_files = create_multipart_zip(folder_dir, zip_dir, max_zip_size_mb)
-        zip_files = create_multipart_zip(archive_dir, zip_dir, max_zip_size_mb)
+        # Create multi-part zip for the specific folder, using its name as the base for the zip files.
+        # This prevents overwriting files from other folders and fixes the nesting issue.
+        zip_files = create_multipart_zip(
+            source_folder=folder_dir,
+            output_dir=zip_dir,
+            max_size_mb=max_zip_size_mb,
+            base_name=folder_dir.name  # Use the folder's name (e.g., 'INBOX', 'Sent_Items')
+        )
         
         if zip_files:
             folder_info = {
@@ -313,7 +322,7 @@ def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed:
             compression_summary['folders_compressed'].append(folder_info)
             
             print(f"  Compressed to {len(zip_files)} parts")
-            print(f"  Compression: {folder_info['original_size_mb']}MB → {folder_info['compressed_size_mb']}MB ({folder_info['compression_ratio']}% reduction)")
+            print(f"  Compression: {folder_info['original_size_mb']:.1f}MB -> {folder_info['compressed_size_mb']:.1f}MB ({folder_info['compression_ratio']}% reduction)")
             
             # Remove original folder if not keeping uncompressed
             if not keep_uncompressed:
@@ -379,11 +388,13 @@ def archive_messages(args):
             msg_ids = search_messages(mail, folder, date_criteria)
             
             if not msg_ids:
-                print(f"No messages found in {folder}")
+                print(f"No messages to download in {folder} for the given criteria.")
                 continue
             
             # Create folder-specific output directory only if messages exist
-            folder_dir = output_dir / folder.replace('/', '_')
+            # Sanitize folder names that might contain path separators like '/'
+            safe_folder_name = folder.replace('/', '_').replace('\\', '_')
+            folder_dir = output_dir / safe_folder_name
             folder_dir.mkdir(exist_ok=True)
             
             # Download messages
@@ -391,11 +402,11 @@ def archive_messages(args):
             folder_errors = 0
             
             for i, msg_id in enumerate(msg_ids, 1):
-                if args.limit and i > args.limit:
-                    print(f"Reached limit of {args.limit} messages")
+                if args.limit and total_downloaded >= args.limit:
+                    print(f"Reached overall limit of {args.limit} messages")
                     break
                 
-                print(f"Downloading message {i}/{len(msg_ids)}: {msg_id.decode()}")
+                print(f"Downloading message {i}/{len(msg_ids)} from '{folder}': {msg_id.decode()}", end='\r')
                 
                 if download_message(mail, msg_id, str(folder_dir), args.delete_messages):
                     total_downloaded += 1
@@ -405,42 +416,40 @@ def archive_messages(args):
                 else:
                     total_errors += 1
                     folder_errors += 1
-                
-                # Progress update
-                if i % 10 == 0:
-                    print(f"Progress: {i}/{len(msg_ids)} messages processed")
             
-            # Expunge deleted messages if deletion was enabled
+            print() # Newline after the progress indicator
+            
+            # Expunge deleted messages if deletion was enabled for this folder
             if args.delete_messages and folder_downloaded > 0:
                 print(f"Expunging {folder_downloaded} deleted messages from {folder}...")
                 expunge_deleted_messages(mail, folder)
             
-            print(f"Folder {folder} complete: {folder_downloaded} downloaded, {folder_errors} errors")
+            print(f"Folder '{folder}' complete: {folder_downloaded} downloaded, {folder_errors} errors")
         
         # No messages downloaded: exit early
         if total_downloaded == 0:
-            print("\nNo messages were downloaded from any folder. Nothing to archive.")
+            print("\nNo messages were downloaded from any folder. Nothing to compress.")
             return True
         
         print(f"\nArchiving complete!")
         print(f"Total downloaded: {total_downloaded}")
         print(f"Total errors: {total_errors}")
         if args.delete_messages:
-            print(f"Total deleted from server: {total_deleted}")
+            print(f"Total marked for deletion: {total_deleted}")
         
         # Create summary report
         summary = {
             'timestamp': datetime.now().isoformat(),
             'server': args.server,
-            'folders': folders,
+            'folders_processed': folders,
             'date_range': {
                 'start': args.start_date.isoformat() if args.start_date else None,
                 'end': args.end_date.isoformat() if args.end_date else None
             },
             'total_downloaded': total_downloaded,
             'total_errors': total_errors,
-            'total_deleted': total_deleted if args.delete_messages else 0,
-            'delete_messages': args.delete_messages
+            'total_deleted_from_server': total_deleted if args.delete_messages else 0,
+            'delete_enabled': args.delete_messages
         }
         
         with open(output_dir / 'archive_summary.json', 'w') as f:
@@ -449,13 +458,18 @@ def archive_messages(args):
         # Compress folders if requested
         if args.compress:
             compression_summary = compress_folders(output_dir, args.max_zip_size, args.keep_uncompressed)
-            print(f"\nCompression complete! Created {len(compression_summary['folders_compressed'])} compressed folder sets.")
+            if compression_summary.get('folders_compressed'):
+                print(f"\nCompression complete! Created archives for {len(compression_summary['folders_compressed'])} folder(s).")
+            else:
+                print("\nCompression step finished, but no folders were compressed (they may have been empty).")
         
         return True
     
     finally:
-        mail.close()
-        mail.logout()
+        if mail:
+            mail.close()
+            mail.logout()
+            print("Disconnected from server.")
 
 def parse_date(date_string):
     """Parse date string to datetime object"""
@@ -491,8 +505,8 @@ Examples:
                        help='IMAP server port (default: 993 for SSL, 143 for non-SSL)')
     parser.add_argument('-u', '--username', required=True,
                        help='Username for IMAP login')
-    parser.add_argument('--password', required=True,
-                       help='Password for IMAP login (required for automation)')
+    parser.add_argument('--password',
+                       help='Password for IMAP login (will prompt if not provided)')
     parser.add_argument('--no-ssl', action='store_false', dest='ssl',
                        help='Disable SSL connection')
     
@@ -503,12 +517,12 @@ Examples:
                        help='End date for message range (YYYY-MM-DD)')
     
     # Folders and limits
-    parser.add_argument('--folders', nargs='+', default=['INBOX'],
-                       help='Folders to archive (default: INBOX)')
+    parser.add_argument('--folders', nargs='+',
+                       help='Folders to archive (e.g., INBOX "Sent Items"). If not provided and --all-folders is not used, defaults to INBOX.')
     parser.add_argument('--all-folders', action='store_true',
                        help='Archive all folders from the server (overrides --folders)')
     parser.add_argument('--limit', type=int,
-                       help='Maximum number of messages to download per folder')
+                       help='Maximum total number of messages to download across all folders')
     
     # Message deletion options
     parser.add_argument('--delete-messages', action='store_true',
@@ -524,7 +538,7 @@ Examples:
     parser.add_argument('--compress', action='store_true',
                        help='Compress archived folders into multi-part zip files')
     parser.add_argument('--max-zip-size', type=int, default=100,
-                       help='Maximum size for each zip file in MB (default: 100)')
+                       help='Maximum size for each zip file part in MB (default: 100)')
     parser.add_argument('--keep-uncompressed', action='store_true',
                        help='Keep original uncompressed folders after compression')
     
@@ -538,6 +552,10 @@ Examples:
     # Adjust default port for non-SSL
     if not args.ssl and args.port == 993:
         args.port = 143
+
+    # Set default folder if none specified
+    if not args.folders and not args.all_folders:
+        args.folders = ['INBOX']
     
     print(f"Starting email archival from {args.server}:{args.port}")
     print(f"Username: {args.username}")
@@ -545,9 +563,9 @@ Examples:
     print(f"Output directory: {args.output_dir}")
     
     if archive_messages(args):
-        print("Archival completed successfully!")
+        print("\nArchival process completed successfully!")
     else:
-        print("Archival failed!")
+        print("\nArchival process failed!")
         sys.exit(1)
 
 if __name__ == "__main__":
