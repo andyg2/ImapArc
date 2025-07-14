@@ -7,6 +7,7 @@ import imaplib
 import email
 import argparse
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 import json
@@ -64,19 +65,28 @@ def get_all_folders(mail):
             print(f"Error getting folder list: {folders}")
             return []
         
+        if folders == ['']:
+            print("No folders found")
+            return []
+
         folder_list = []
         for folder in folders:
-            # Parse folder name from IMAP LIST response
-            # Format: '(\\HasNoChildren) "/" "INBOX"'
             folder_str = folder.decode('utf-8')
-            parts = folder_str.split('"')
-            if len(parts) >= 3:
-                folder_name = parts[-2]  # Get the folder name
-                folder_list.append(folder_name)
+
+            # Try to get the last word as folder name (after delimiter)
+            # Handles both: 
+            #   (\Flags) "." "INBOX.Name"
+            #   (\Flags) "." INBOX.Name
+            parts = folder_str.rsplit(' ', 1)
+            if len(parts) == 2:
+                raw_name = parts[-1].strip('"')
+                if raw_name:  # Skip empty names
+                    folder_list.append(raw_name)
+            else:
+                print(f"Could not parse folder: {folder_str}")
         
         print(f"Found {len(folder_list)} folders: {', '.join(folder_list)}")
         return folder_list
-    
     except Exception as e:
         print(f"Error getting folders: {e}")
         return []
@@ -84,8 +94,13 @@ def get_all_folders(mail):
 def search_messages(mail, folder, date_criteria):
     """Search for messages based on criteria"""
     try:
-        # Select folder
-        status, messages = mail.select(folder)
+        # Select folder with error handling
+        try:
+            status, messages = mail.select(folder)
+        except imaplib.IMAP4.error as e:
+            print(f"Error selecting folder {folder}: {e}")
+            return []
+            
         if status != 'OK':
             print(f"Error selecting folder {folder}: {messages}")
             return []
@@ -218,7 +233,7 @@ def create_multipart_zip(source_folder: Path, output_dir: Path, max_size_mb: int
     current_zip_num = 1
     
     # Create base name for zip files
-    base_name = source_folder.name
+    base_name = "email_archive"
     current_zip_path = output_dir / f"{base_name}_part{current_zip_num:03d}.zip"
     current_zip = zipfile.ZipFile(current_zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6)
     
@@ -277,6 +292,7 @@ def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed:
         
         # Create multi-part zip
         zip_files = create_multipart_zip(folder_dir, zip_dir, max_zip_size_mb)
+        zip_files = create_multipart_zip(archive_dir, zip_dir, max_zip_size_mb)
         
         if zip_files:
             folder_info = {
@@ -289,7 +305,10 @@ def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed:
             # Calculate total compressed size
             total_compressed_size = sum(os.path.getsize(zf) for zf in zip_files)
             folder_info['compressed_size_mb'] = round(total_compressed_size / (1024*1024), 2)
-            folder_info['compression_ratio'] = round((1 - total_compressed_size / folder_size) * 100, 1)
+            if folder_size == 0:
+                folder_info['compression_ratio'] = 0
+            else:
+                folder_info['compression_ratio'] = round((1 - total_compressed_size / folder_size) * 100, 1)
             
             compression_summary['folders_compressed'].append(folder_info)
             
@@ -356,16 +375,16 @@ def archive_messages(args):
         for folder in folders:
             print(f"\nProcessing folder: {folder}")
             
-            # Create folder-specific output directory
-            folder_dir = output_dir / folder.replace('/', '_')
-            folder_dir.mkdir(exist_ok=True)
-            
             # Search messages
             msg_ids = search_messages(mail, folder, date_criteria)
             
             if not msg_ids:
                 print(f"No messages found in {folder}")
                 continue
+            
+            # Create folder-specific output directory only if messages exist
+            folder_dir = output_dir / folder.replace('/', '_')
+            folder_dir.mkdir(exist_ok=True)
             
             # Download messages
             folder_downloaded = 0
@@ -397,6 +416,11 @@ def archive_messages(args):
                 expunge_deleted_messages(mail, folder)
             
             print(f"Folder {folder} complete: {folder_downloaded} downloaded, {folder_errors} errors")
+        
+        # No messages downloaded: exit early
+        if total_downloaded == 0:
+            print("\nNo messages were downloaded from any folder. Nothing to archive.")
+            return True
         
         print(f"\nArchiving complete!")
         print(f"Total downloaded: {total_downloaded}")
