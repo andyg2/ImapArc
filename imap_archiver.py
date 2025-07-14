@@ -16,7 +16,8 @@ from pathlib import Path
 import getpass
 import zipfile
 import shutil
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from email.utils import parsedate_to_datetime # Added for robust date parsing
 
 def create_ssl_context():
     """Create SSL context for secure connection"""
@@ -208,14 +209,41 @@ def get_folder_size(folder_path: Path) -> int:
                 pass
     return total_size
 
-# --- MODIFIED FUNCTION ---
+# --- NEW FUNCTION ---
+def get_date_range_from_folder(folder_path: Path) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Scans a folder for metadata files and returns the minimum and maximum email dates.
+    """
+    min_date, max_date = None, None
+    
+    # Use rglob to find all metadata files recursively
+    for metadata_file in folder_path.rglob('*_metadata.json'):
+        try:
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+            
+            date_str = metadata.get('date')
+            if not date_str:
+                continue
+            
+            # Use email.utils.parsedate_to_datetime for robust parsing of RFC 2822 dates
+            email_date = parsedate_to_datetime(date_str)
+            
+            if email_date:
+                # Naive comparison works fine if we just want the range
+                if min_date is None or email_date < min_date:
+                    min_date = email_date
+                if max_date is None or email_date > max_date:
+                    max_date = email_date
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            print(f"  Warning: Could not parse date from {metadata_file.name}: {e}")
+            continue
+
+    return min_date, max_date
+
 def create_multipart_zip(source_folder: Path, output_dir: Path, max_size_mb: int = 100, base_name: str = "email_archive") -> List[str]:
     """
     Create multi-part (split) zip files from a source folder.
-
-    Note: Python's standard zipfile library creates multiple independent zip files (a "split" archive)
-    rather than a true "spanned" archive (e.g., .z01, .z02, .zip). This implementation
-    splits the content into separate, manageable zip files that must be extracted individually.
     """
     max_size_bytes = max_size_mb * 1024 * 1024
     
@@ -275,7 +303,7 @@ def create_multipart_zip(source_folder: Path, output_dir: Path, max_size_mb: int
 
 # --- MODIFIED FUNCTION ---
 def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed: bool = False) -> dict:
-    """Compress all uncompressed folder archives into multi-part zip files."""
+    """Compress all uncompressed folder archives into multi-part zip files with date-ranged names."""
     print(f"\nCompressing archived folders (max size: {max_zip_size_mb}MB per zip part)...")
     
     zip_dir = archive_dir / "compressed"
@@ -294,13 +322,24 @@ def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed:
         folder_size = get_folder_size(folder_dir)
         print(f"\nProcessing {folder_dir.name} ({folder_size / (1024*1024):.1f} MB)...")
         
-        # Create multi-part zip for the specific folder, using its name as the base for the zip files.
-        # This prevents overwriting files from other folders and fixes the nesting issue.
+        # --- NEW LOGIC TO GET DATE RANGE AND CREATE FILENAME ---
+        min_date, max_date = get_date_range_from_folder(folder_dir)
+        
+        base_name = folder_dir.name # Fallback name
+        if min_date and max_date:
+            date_format = "%Y-%m-%d"
+            date_range_str = f"{min_date.strftime(date_format)}_to_{max_date.strftime(date_format)}"
+            base_name = f"{date_range_str}_{folder_dir.name}"
+            print(f"  Determined content date range: {min_date.date()} to {max_date.date()}")
+        else:
+            print(f"  Warning: Could not determine date range for {folder_dir.name}. Using default name.")
+        # --- END NEW LOGIC ---
+
         zip_files = create_multipart_zip(
             source_folder=folder_dir,
             output_dir=zip_dir,
             max_size_mb=max_zip_size_mb,
-            base_name=folder_dir.name  # Use the folder's name (e.g., 'INBOX', 'Sent_Items')
+            base_name=base_name # Use the new name with the date range
         )
         
         if zip_files:
@@ -322,7 +361,7 @@ def compress_folders(archive_dir: Path, max_zip_size_mb: int, keep_uncompressed:
             compression_summary['folders_compressed'].append(folder_info)
             
             print(f"  Compressed to {len(zip_files)} parts")
-            print(f"  Compression: {folder_info['original_size_mb']:.1f}MB -> {folder_info['compressed_size_mb']:.1f}MB ({folder_info['compression_ratio']}% reduction)")
+            print(f"  Compression: {folder_info['original_size_mb']:.1f}MB -> {folder_info['compressed_size_mb']:.1f}MB ({folder_info['compression_ratio']:.1f}% reduction)")
             
             # Remove original folder if not keeping uncompressed
             if not keep_uncompressed:
